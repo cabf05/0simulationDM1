@@ -4,12 +4,12 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 # =========================================================
-# CONFIG
+# CONFIGURAÇÃO
 # =========================================================
-st.set_page_config("CGM Clinical Trainer", layout="wide")
+st.set_page_config(page_title="CGM Clinical Simulator", layout="wide")
 
-DT = 5
-STEPS_PER_DAY = 288
+DT = 5                       # minutos
+STEPS_PER_DAY = 1440 // DT   # 288
 
 # =========================================================
 # MODELOS
@@ -24,43 +24,47 @@ class PhysiologyState:
 class PatientProfile:
     def __init__(self, variability):
         self.variability = variability
-        self.isf = 40
-        self.carb_abs = [0.03, 0.01]
+        self.isf = 40                      # mg/dL por U
+        self.carb_abs = [0.03, 0.01]       # rápido / lento
 
 
 class PumpSettings:
     def __init__(self, basal_profile, ic):
-        self.basal_profile = basal_profile  # dict hour -> U/h
+        self.basal_profile = basal_profile
         self.ic = ic
 
 
 # =========================================================
-# MOTOR
+# MOTOR FISIOLÓGICO
 # =========================================================
 def step_simulation(state, patient, pump, minute):
     hour = minute // 60
+
+    # Basal
     basal_u = pump.basal_profile.get(hour, 1.0) * DT / 60
     state.insulin[0] += basal_u
 
-    k = [0.25, 0.20, 0.15, 0.10]
+    # Cinética da insulina
+    transfer_rates = [0.25, 0.20, 0.15, 0.10]
     for i in range(3, 0, -1):
-        transfer = state.insulin[i-1] * k[i-1]
-        state.insulin[i] += transfer
-        state.insulin[i-1] -= transfer
+        moved = state.insulin[i - 1] * transfer_rates[i - 1]
+        state.insulin[i] += moved
+        state.insulin[i - 1] -= moved
 
     insulin_effect = state.insulin.sum() * patient.isf * DT / 240
 
-    carb_absorbed = 0
+    # Absorção de carboidrato
+    carb_effect = 0
     for i in range(2):
         absorbed = state.carbs[i] * patient.carb_abs[i]
-        carb_absorbed += absorbed
+        carb_effect += absorbed
         state.carbs[i] -= absorbed
 
-    # Variabilidade SISTEMÁTICA (não ruído branco)
-    circadian = 5 * np.sin(2 * np.pi * hour / 24)
+    # Variabilidade fisiológica REAL
+    circadian = 6 * np.sin(2 * np.pi * hour / 24)
     noise = np.random.normal(0, patient.variability)
 
-    state.glucose += carb_absorbed
+    state.glucose += carb_effect
     state.glucose -= insulin_effect
     state.glucose += 0.8
     state.glucose += circadian
@@ -69,6 +73,9 @@ def step_simulation(state, patient, pump, minute):
     state.glucose = max(40, state.glucose)
 
 
+# =========================================================
+# SIMULAÇÃO
+# =========================================================
 def simulate(days, patient, pump):
     state = PhysiologyState()
     records = []
@@ -76,21 +83,21 @@ def simulate(days, patient, pump):
     base_meals = [(480, 60), (780, 70), (1140, 65)]
 
     for day in range(days):
-        daily_meals = [
-            (t + np.random.randint(-20, 20), c + np.random.randint(-10, 10))
+        meals = [
+            (t + np.random.randint(-20, 20),
+             c + np.random.randint(-10, 10))
             for t, c in base_meals
         ]
 
         for step in range(STEPS_PER_DAY):
             minute = step * DT
 
-            for meal_time, carbs in daily_meals:
+            for meal_time, carbs in meals:
                 if minute == meal_time:
                     state.carbs[0] += carbs * 0.7
                     state.carbs[1] += carbs * 0.3
 
-                    # Bolus IMPERFEITO
-                    bolus = carbs / pump.ic * np.random.normal(1, 0.15)
+                    bolus = (carbs / pump.ic) * np.random.normal(1, 0.15)
                     state.insulin[0] += bolus
 
             step_simulation(state, patient, pump, minute)
@@ -105,26 +112,29 @@ def simulate(days, patient, pump):
 
 
 # =========================================================
-# AGP REAL
+# AGP CLÍNICO (ROBUSTO)
 # =========================================================
 def plot_agp(df):
     agp = (
         df.groupby("minute")["glucose"]
         .agg(
-            median=np.median,
+            median=lambda x: np.percentile(x, 50),
             p10=lambda x: np.percentile(x, 10),
             p25=lambda x: np.percentile(x, 25),
             p75=lambda x: np.percentile(x, 75),
             p90=lambda x: np.percentile(x, 90),
         )
-        .reset_index()
     )
 
-    fig, ax = plt.subplots(figsize=(10, 4))
+    # garante eixo completo 0–1435
+    full_index = np.arange(0, 1440, DT)
+    agp = agp.reindex(full_index).interpolate()
 
-    ax.fill_between(agp.minute, agp.p25, agp.p75, alpha=0.4)
-    ax.fill_between(agp.minute, agp.p10, agp.p90, alpha=0.2)
-    ax.plot(agp.minute, agp.median, linewidth=2)
+    fig, ax = plt.subplots(figsize=(11, 4))
+
+    ax.fill_between(full_index, agp["p25"], agp["p75"], alpha=0.45)
+    ax.fill_between(full_index, agp["p10"], agp["p90"], alpha=0.25)
+    ax.plot(full_index, agp["median"], linewidth=2)
 
     ax.axhline(70, linestyle="--")
     ax.axhline(180, linestyle="--")
@@ -138,7 +148,7 @@ def plot_agp(df):
 
 
 # =========================================================
-# SESSION STATE
+# SESSION STATE (SEGUIMENTO)
 # =========================================================
 if "basal_profile" not in st.session_state:
     st.session_state.basal_profile = {h: 1.0 for h in range(24)}
@@ -146,28 +156,30 @@ if "basal_profile" not in st.session_state:
 if "ic" not in st.session_state:
     st.session_state.ic = 10
 
-# =========================================================
-# SIDEBAR – AJUSTES CLÍNICOS
-# =========================================================
-st.sidebar.header("Ajustes para próxima consulta")
 
-night_basal = st.sidebar.slider("Basal noturno (0–6h)", 0.3, 2.5, 1.0, 0.1)
-day_basal = st.sidebar.slider("Basal diurno (6–22h)", 0.3, 2.5, 1.0, 0.1)
+# =========================================================
+# SIDEBAR – PRÓXIMA CONSULTA
+# =========================================================
+st.sidebar.header("Ajustes terapêuticos")
+
+basal_night = st.sidebar.slider("Basal 0–6h (U/h)", 0.3, 2.5, 1.0, 0.1)
+basal_day = st.sidebar.slider("Basal 6–24h (U/h)", 0.3, 2.5, 1.0, 0.1)
 
 for h in range(24):
-    st.session_state.basal_profile[h] = night_basal if h < 6 else day_basal
+    st.session_state.basal_profile[h] = basal_night if h < 6 else basal_day
 
 st.session_state.ic = st.sidebar.slider("IC (g/U)", 5, 20, st.session_state.ic)
-
 variability = st.sidebar.slider("Variabilidade CGM", 2.0, 10.0, 6.0)
 
 # =========================================================
 # EXECUÇÃO
 # =========================================================
+st.title("Simulador Clínico de CGM")
+
 if st.button("▶️ Rodar consulta"):
     patient = PatientProfile(variability)
     pump = PumpSettings(st.session_state.basal_profile, st.session_state.ic)
 
-    df = simulate(14, patient, pump)
+    df = simulate(days=14, patient=patient, pump=pump)
 
     st.pyplot(plot_agp(df))
