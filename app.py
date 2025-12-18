@@ -1,185 +1,257 @@
 import streamlit as st
-import pandas as pd
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 from io import StringIO
 
-# ---------------------------
-# CONFIGURAÇÃO GERAL
-# ---------------------------
-st.set_page_config(page_title="Insulin Pump Clinical Simulator", layout="wide")
+# =========================================================
+# CONFIGURAÇÃO
+# =========================================================
+st.set_page_config("Insulin Pump Clinical Simulator", layout="wide")
 
-TIME_STEP_MIN = 5
-DAY_MINUTES = 24 * 60
-STEPS_PER_DAY = DAY_MINUTES // TIME_STEP_MIN
+DT = 5                 # minutos
+STEPS_PER_DAY = 288    # 24h / 5min
+TARGET_GLUCOSE = 110
 
-# ---------------------------
-# MODELOS CLÍNICOS
-# ---------------------------
+# =========================================================
+# MODELOS FISIOLÓGICOS
+# =========================================================
+class PhysiologyState:
+    def __init__(self):
+        self.glucose = 110.0
+        self.insulin = np.zeros(4)   # compartimentos de insulina
+        self.carbs = np.zeros(2)     # compartimentos de carboidrato
+
+    def to_dict(self):
+        return {
+            "glucose": self.glucose,
+            "insulin": self.insulin.tolist(),
+            "carbs": self.carbs.tolist()
+        }
+
+    @staticmethod
+    def from_dict(d):
+        s = PhysiologyState()
+        s.glucose = d["glucose"]
+        s.insulin = np.array(d["insulin"])
+        s.carbs = np.array(d["carbs"])
+        return s
+
+
 class PatientProfile:
-    def __init__(self, bolus_delay_min=0):
-        self.age = 35
-        self.weight = 75
-        self.isf = 40          # mg/dL por U
-        self.carb_abs_min = 90
-        self.insulin_action_min = 240
-        self.target_glucose = 110
-        self.bolus_delay_min = bolus_delay_min
+    def __init__(self, bolus_delay, variability):
+        self.bolus_delay = bolus_delay
+        self.variability = variability
+        self.isf = 40         # mg/dL por U
+        self.carb_abs = [0.03, 0.01]  # rápida / lenta
 
 
 class PumpSettings:
-    def __init__(self, basal=1.0, ic=10):
-        self.basal = basal     # U/h
-        self.ic = ic           # g/U
+    def __init__(self, basal, ic):
+        self.basal = basal   # U/h
+        self.ic = ic         # g/U
 
 
-# ---------------------------
-# SIMULAÇÃO
-# ---------------------------
-def simulate(patient, pump, days, pump_type):
-    glucose = 110
-    IOB = 0
-    COB = 0
+# =========================================================
+# MOTOR DE SIMULAÇÃO
+# =========================================================
+def step_simulation(state, patient, pump, pump_type):
+    # Produção hepática basal
+    hepatic = 0.8
 
-    history = []
+    # Basal
+    basal_u = pump.basal * DT / 60
+    state.insulin[0] += basal_u
+
+    # Automação simplificada
+    if pump_type == "Suspensão automática" and state.glucose < 70:
+        state.insulin[0] -= basal_u
+    elif pump_type == "Híbrido (AID)":
+        if state.glucose > 160:
+            state.insulin[0] += 0.05
+        if state.glucose < 80:
+            state.insulin[0] -= 0.05
+
+    # Dinâmica da insulina (compartimentos)
+    k = [0.25, 0.20, 0.15, 0.10]
+    for i in range(3, 0, -1):
+        transfer = state.insulin[i-1] * k[i-1]
+        state.insulin[i] += transfer
+        state.insulin[i-1] -= transfer
+
+    insulin_effect = state.insulin.sum() * patient.isf * DT / 240
+
+    # Carboidratos
+    carb_absorbed = 0
+    for i in range(2):
+        absorbed = state.carbs[i] * patient.carb_abs[i]
+        carb_absorbed += absorbed
+        state.carbs[i] -= absorbed
+
+    # Variabilidade fisiológica
+    noise = np.random.normal(0, patient.variability)
+
+    # Atualização glicêmica
+    state.glucose += carb_absorbed
+    state.glucose -= insulin_effect
+    state.glucose += hepatic
+    state.glucose += noise
+
+    state.glucose = max(40, state.glucose)
+
+
+def simulate_consultation(state, patient, pump, pump_type, days):
+    records = []
 
     meals = [
-        {"time": 8 * 60, "carbs": 50},
-        {"time": 13 * 60, "carbs": 70},
-        {"time": 19 * 60, "carbs": 60},
+        (8 * 60, 50),
+        (13 * 60, 70),
+        (19 * 60, 60)
     ]
 
     for day in range(days):
         for step in range(STEPS_PER_DAY):
-            time_min = step * TIME_STEP_MIN
+            t = step * DT
 
-            # Basal
-            basal_u = pump.basal * (TIME_STEP_MIN / 60)
-            IOB += basal_u
+            for meal_time, carbs in meals:
+                if t == meal_time:
+                    state.carbs[0] += carbs * 0.7
+                    state.carbs[1] += carbs * 0.3
 
-            # Automação conforme tipo de bomba
-            if pump_type == "Suspensão automática" and glucose < 70:
-                IOB -= basal_u  # suspende basal
-            elif pump_type == "Híbrido (AID)":
-                if glucose > 150:
-                    IOB += 0.05
-                if glucose < 80:
-                    IOB -= 0.05
+                if t == meal_time + patient.bolus_delay:
+                    bolus = carbs / pump.ic
+                    state.insulin[0] += bolus
 
-            # Refeições
-            for meal in meals:
-                if time_min == meal["time"]:
-                    COB += meal["carbs"]
+            step_simulation(state, patient, pump, pump_type)
 
-                bolus_time = meal["time"] + patient.bolus_delay_min
-                if time_min == bolus_time:
-                    bolus = meal["carbs"] / pump.ic
-                    IOB += bolus
-
-            # Absorção de carboidrato
-            absorbed = COB * (TIME_STEP_MIN / patient.carb_abs_min)
-            COB -= absorbed
-            glucose += absorbed
-
-            # Ação da insulina
-            insulin_effect = IOB * (TIME_STEP_MIN / patient.insulin_action_min) * patient.isf
-            glucose -= insulin_effect
-            IOB -= IOB * (TIME_STEP_MIN / patient.insulin_action_min)
-
-            history.append({
+            records.append({
                 "day": day + 1,
-                "minute": time_min,
-                "glucose": glucose,
-                "IOB": IOB
+                "minute": t,
+                "glucose": state.glucose
             })
 
-    return pd.DataFrame(history)
+    return state, pd.DataFrame(records)
 
 
-# ---------------------------
+# =========================================================
+# RESUMO CLÍNICO
+# =========================================================
+def clinical_summary(df):
+    mean = df.glucose.mean()
+    tir = ((df.glucose >= 70) & (df.glucose <= 180)).mean() * 100
+    hypos = (df.glucose < 70).sum()
+    hypers = (df.glucose > 180).sum()
+
+    summary = []
+    if mean > 160:
+        summary.append("Hiperglicemia média elevada")
+    if hypos > 5:
+        summary.append("Hipoglicemias frequentes")
+    if tir < 60:
+        summary.append("Tempo em alvo reduzido")
+
+    return {
+        "mean": round(mean, 1),
+        "tir": round(tir, 1),
+        "hypos": int(hypos),
+        "hypers": int(hypers),
+        "notes": summary
+    }
+
+
+# =========================================================
 # INTERFACE
-# ---------------------------
+# =========================================================
 st.title("🩺 Insulin Pump Clinical Simulator")
-st.markdown("**Foco: raciocínio clínico longitudinal — não operação do dispositivo**")
+st.markdown("**Treinamento em raciocínio clínico longitudinal**")
 
-# Sidebar — parâmetros
-st.sidebar.header("Configuração da Simulação")
+if "state" not in st.session_state:
+    st.session_state.state = PhysiologyState()
+    st.session_state.consult = 1
+    st.session_state.history = []
+
+st.sidebar.header("Configuração")
 
 pump_type = st.sidebar.selectbox(
     "Tipo de bomba",
     ["Convencional", "Suspensão automática", "Híbrido (AID)"]
 )
 
-days_per_consult = st.sidebar.slider("Duração de cada consulta (dias)", 7, 28, 14)
+days = st.sidebar.slider("Duração da consulta (dias)", 7, 30, 14)
 
-st.sidebar.subheader("Parâmetros Clínicos (editáveis)")
 basal = st.sidebar.slider("Basal (U/h)", 0.5, 2.0, 1.0, 0.1)
 ic = st.sidebar.slider("IC (g/U)", 5, 20, 10)
 
-# Pacientes
-st.sidebar.subheader("Perfis de Paciente")
 delay = st.sidebar.slider("Atraso de bolus (min)", 0, 30, 15)
+variability = st.sidebar.slider("Variabilidade fisiológica", 0.0, 5.0, 1.0)
 
-patient_A = PatientProfile(bolus_delay_min=0)
-patient_B = PatientProfile(bolus_delay_min=delay)
+patient = PatientProfile(delay, variability)
+pump = PumpSettings(basal, ic)
 
-pump = PumpSettings(basal=basal, ic=ic)
-
-# ---------------------------
-# SIMULAR
-# ---------------------------
-if st.button("▶️ Iniciar Simulação"):
-    with st.spinner("Simulando..."):
-        df_A = simulate(patient_A, pump, days_per_consult, pump_type)
-        df_B = simulate(patient_B, pump, days_per_consult, pump_type)
-
-    st.success("Simulação concluída")
-
-    col1, col2 = st.columns(2)
-
-    for df, title, col in [
-        (df_A, "Paciente sem atraso", col1),
-        (df_B, "Paciente com atraso", col2)
-    ]:
-        with col:
-            st.subheader(title)
-
-            fig, ax = plt.subplots()
-            ax.plot(df["glucose"])
-            ax.axhline(70, linestyle="--")
-            ax.axhline(180, linestyle="--")
-            ax.set_ylabel("Glicemia (mg/dL)")
-            ax.set_xlabel("Tempo (passos de 5 min)")
-            st.pyplot(fig)
-
-            st.metric("Média glicêmica", round(df["glucose"].mean(), 1))
-            tir = ((df["glucose"] >= 70) & (df["glucose"] <= 180)).mean() * 100
-            st.metric("TIR (%)", round(tir, 1))
-
-    # Exportação
-    st.subheader("📤 Exportar / 📥 Importar Simulação")
-
-    csv = df_B.to_csv(index=False)
-    st.download_button(
-        label="Exportar simulação (CSV)",
-        data=csv,
-        file_name="simulacao.csv",
-        mime="text/csv"
+# =========================================================
+# EXECUÇÃO DA CONSULTA
+# =========================================================
+if st.button("▶️ Rodar próxima consulta"):
+    state, df = simulate_consultation(
+        st.session_state.state, patient, pump, pump_type, days
     )
 
-# ---------------------------
-# IMPORTAÇÃO
-# ---------------------------
-uploaded = st.file_uploader("Importar simulação (CSV)", type="csv")
+    summary = clinical_summary(df)
+    st.session_state.state = state
+    st.session_state.history.append((df, summary))
+    st.session_state.consult += 1
 
-if uploaded:
-    df_import = pd.read_csv(uploaded)
-    st.subheader("Simulação Importada")
+# =========================================================
+# VISUALIZAÇÃO
+# =========================================================
+for i, (df, summary) in enumerate(st.session_state.history):
+    st.subheader(f"Consulta {i+1}")
 
     fig, ax = plt.subplots()
-    ax.plot(df_import["glucose"])
+    ax.plot(df.glucose)
     ax.axhline(70, linestyle="--")
     ax.axhline(180, linestyle="--")
     st.pyplot(fig)
 
-    st.write(df_import.head())
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Glicemia média", summary["mean"])
+    col2.metric("TIR (%)", summary["tir"])
+    col3.metric("Hipoglicemias", summary["hypos"])
+
+    if summary["notes"]:
+        st.info("Resumo clínico: " + " • ".join(summary["notes"]))
+
+# =========================================================
+# EXPORT / IMPORT
+# =========================================================
+st.subheader("📦 Exportar / Importar Simulação")
+
+if st.session_state.history:
+    export = {
+        "state": st.session_state.state.to_dict(),
+        "consult": st.session_state.consult,
+        "history": [
+            {
+                "summary": s,
+                "data": d.to_dict()
+            }
+            for d, s in st.session_state.history
+        ]
+    }
+
+    df_export = pd.DataFrame([export])
+    st.download_button(
+        "Exportar simulação (CSV)",
+        df_export.to_csv(index=False),
+        "simulation_snapshot.csv",
+        "text/csv"
+    )
+
+uploaded = st.file_uploader("Importar simulação", type="csv")
+
+if uploaded:
+    raw = pd.read_csv(uploaded).iloc[0]
+    st.session_state.state = PhysiologyState.from_dict(eval(raw["state"]))
+    st.session_state.consult = raw["consult"]
+    st.session_state.history = []
+    st.success("Simulação restaurada com sucesso")
