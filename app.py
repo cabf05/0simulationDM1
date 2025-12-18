@@ -1,5 +1,5 @@
 # =========================================================
-# INSULIN PUMP CLINICAL SIMULATOR – EDUCATIONAL VERSION
+# INSULIN PUMP CLINICAL TRAINER – STREAMLIT APP
 # =========================================================
 
 import streamlit as st
@@ -130,7 +130,7 @@ def simulate_consultation(state, patient, pump, pump_type, days):
 
 
 # =========================================================
-# MÉTRICAS CLÍNICAS (CGM-LIKE)
+# MÉTRICAS CLÍNICAS
 # =========================================================
 def clinical_metrics(df):
     mean = df.glucose.mean()
@@ -193,7 +193,7 @@ def interpretation_guide():
 
 | Indicador | Interpretação |
 |---------|---------------|
-| TIR < 60% | Controle glicêmico global inadequado |
+| TIR < 60% | Controle glicêmico inadequado |
 | TBR > 4% | Risco aumentado de hipoglicemia |
 | TAR elevado | Ajustar basal ou bolus |
 | CV > 36% | Alta variabilidade glicêmica |
@@ -206,17 +206,22 @@ def interpretation_guide():
 st.title("🩺 Insulin Pump Clinical Trainer")
 st.markdown("**Treinamento estruturado de raciocínio clínico em bomba de insulina**")
 
-# ---------------------------------------------------------
-# SESSION STATE
-# ---------------------------------------------------------
+# =========================================================
+# SESSION STATE – INICIALIZAÇÃO SEGURA
+# =========================================================
 if "state" not in st.session_state:
     st.session_state.state = PhysiologyState()
+
+if "history" not in st.session_state:
     st.session_state.history = []
+
+if "step" not in st.session_state:
     st.session_state.step = 0
 
-# ---------------------------------------------------------
+
+# =========================================================
 # SIDEBAR
-# ---------------------------------------------------------
+# =========================================================
 st.sidebar.header("Configuração do paciente")
 
 pump_type = st.sidebar.selectbox(
@@ -234,9 +239,9 @@ variability = st.sidebar.slider("Variabilidade fisiológica", 0.0, 5.0, 1.0)
 patient = PatientProfile(delay, variability)
 pump = PumpSettings(basal, ic)
 
-# ---------------------------------------------------------
-# RODAR PRIMEIRA CONSULTA
-# ---------------------------------------------------------
+# =========================================================
+# STEP 0 — PRIMEIRA CONSULTA
+# =========================================================
 if st.session_state.step == 0:
     if st.button("▶️ Rodar primeira consulta"):
         state, df = simulate_consultation(
@@ -246,9 +251,9 @@ if st.session_state.step == 0:
         st.session_state.history.append(df)
         st.session_state.step = 1
 
-# ---------------------------------------------------------
+# =========================================================
 # STEP 1 — REVISÃO
-# ---------------------------------------------------------
+# =========================================================
 if st.session_state.step == 1:
     df = st.session_state.history[-1]
     metrics = clinical_metrics(df)
@@ -265,18 +270,18 @@ if st.session_state.step == 1:
     if st.button("➡️ Interpretar dados"):
         st.session_state.step = 2
 
-# ---------------------------------------------------------
+# =========================================================
 # STEP 2 — INTERPRETAÇÃO
-# ---------------------------------------------------------
+# =========================================================
 if st.session_state.step == 2:
     interpretation_guide()
 
     if st.button("➡️ Decidir ajuste terapêutico"):
         st.session_state.step = 3
 
-# ---------------------------------------------------------
+# =========================================================
 # STEP 3 — DECISÃO TERAPÊUTICA
-# ---------------------------------------------------------
+# =========================================================
 if st.session_state.step == 3:
     st.subheader("⚙️ Decisão terapêutica")
 
