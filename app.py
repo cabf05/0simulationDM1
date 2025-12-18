@@ -1,22 +1,18 @@
-# =========================================================
-# INSULIN PUMP CLINICAL TRAINER – STREAMLIT APP
-# =========================================================
-
 import streamlit as st
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
 # =========================================================
-# CONFIGURAÇÃO
+# CONFIG
 # =========================================================
-st.set_page_config("Insulin Pump Clinical Trainer", layout="wide")
+st.set_page_config("CGM Clinical Trainer", layout="wide")
 
 DT = 5
 STEPS_PER_DAY = 288
 
 # =========================================================
-# MODELOS FISIOLÓGICOS
+# MODELOS
 # =========================================================
 class PhysiologyState:
     def __init__(self):
@@ -26,36 +22,25 @@ class PhysiologyState:
 
 
 class PatientProfile:
-    def __init__(self, bolus_delay, variability):
-        self.bolus_delay = bolus_delay
+    def __init__(self, variability):
         self.variability = variability
         self.isf = 40
         self.carb_abs = [0.03, 0.01]
 
 
 class PumpSettings:
-    def __init__(self, basal, ic):
-        self.basal = basal
+    def __init__(self, basal_profile, ic):
+        self.basal_profile = basal_profile  # dict hour -> U/h
         self.ic = ic
 
 
 # =========================================================
-# MOTOR DE SIMULAÇÃO
+# MOTOR
 # =========================================================
-def step_simulation(state, patient, pump, pump_type):
-    hepatic = 0.8
-
-    basal_u = pump.basal * DT / 60
+def step_simulation(state, patient, pump, minute):
+    hour = minute // 60
+    basal_u = pump.basal_profile.get(hour, 1.0) * DT / 60
     state.insulin[0] += basal_u
-
-    if pump_type == "Suspensão automática" and state.glucose < 70:
-        state.insulin[0] -= basal_u
-
-    if pump_type == "Híbrido (AID)":
-        if state.glucose > 160:
-            state.insulin[0] += 0.05
-        if state.glucose < 80:
-            state.insulin[0] -= 0.05
 
     k = [0.25, 0.20, 0.15, 0.10]
     for i in range(3, 0, -1):
@@ -71,141 +56,118 @@ def step_simulation(state, patient, pump, pump_type):
         carb_absorbed += absorbed
         state.carbs[i] -= absorbed
 
+    # Variabilidade SISTEMÁTICA (não ruído branco)
+    circadian = 5 * np.sin(2 * np.pi * hour / 24)
     noise = np.random.normal(0, patient.variability)
 
     state.glucose += carb_absorbed
     state.glucose -= insulin_effect
-    state.glucose += hepatic
+    state.glucose += 0.8
+    state.glucose += circadian
     state.glucose += noise
 
     state.glucose = max(40, state.glucose)
 
 
-def simulate_consultation(state, patient, pump, pump_type, days):
+def simulate(days, patient, pump):
+    state = PhysiologyState()
     records = []
 
-    meals = [(480, 50), (780, 70), (1140, 60)]
+    base_meals = [(480, 60), (780, 70), (1140, 65)]
 
     for day in range(days):
-        for step in range(STEPS_PER_DAY):
-            t = step * DT
+        daily_meals = [
+            (t + np.random.randint(-20, 20), c + np.random.randint(-10, 10))
+            for t, c in base_meals
+        ]
 
-            for meal_time, carbs in meals:
-                if t == meal_time:
+        for step in range(STEPS_PER_DAY):
+            minute = step * DT
+
+            for meal_time, carbs in daily_meals:
+                if minute == meal_time:
                     state.carbs[0] += carbs * 0.7
                     state.carbs[1] += carbs * 0.3
 
-                if t == meal_time + patient.bolus_delay:
-                    state.insulin[0] += carbs / pump.ic
+                    # Bolus IMPERFEITO
+                    bolus = carbs / pump.ic * np.random.normal(1, 0.15)
+                    state.insulin[0] += bolus
 
-            step_simulation(state, patient, pump, pump_type)
+            step_simulation(state, patient, pump, minute)
 
             records.append({
-                "minute": t,
+                "day": day,
+                "minute": minute,
                 "glucose": state.glucose
             })
 
-    return state, pd.DataFrame(records)
+    return pd.DataFrame(records)
 
 
 # =========================================================
-# MÉTRICAS CLÍNICAS
-# =========================================================
-def clinical_metrics(df):
-    mean = df.glucose.mean()
-    cv = df.glucose.std() / mean * 100
-
-    return {
-        "mean": round(mean, 1),
-        "tir": round(((df.glucose >= 70) & (df.glucose <= 180)).mean() * 100, 1),
-        "tbr": round((df.glucose < 70).mean() * 100, 1),
-        "tar": round((df.glucose > 180).mean() * 100, 1),
-        "cv": round(cv, 1)
-    }
-
-
-# =========================================================
-# AGP SIMPLIFICADO — CORRIGIDO
+# AGP REAL
 # =========================================================
 def plot_agp(df):
-    df = df.copy()
-    df["hour"] = (df.minute // 60).astype(int)
-
     agp = (
-        df.groupby("hour")["glucose"]
+        df.groupby("minute")["glucose"]
         .agg(
             median=np.median,
+            p10=lambda x: np.percentile(x, 10),
             p25=lambda x: np.percentile(x, 25),
             p75=lambda x: np.percentile(x, 75),
+            p90=lambda x: np.percentile(x, 90),
         )
         .reset_index()
     )
 
-    fig, ax = plt.subplots()
+    fig, ax = plt.subplots(figsize=(10, 4))
 
-    ax.fill_between(agp["hour"], agp["p25"], agp["p75"], alpha=0.3)
-    ax.plot(agp["hour"], agp["median"])
+    ax.fill_between(agp.minute, agp.p25, agp.p75, alpha=0.4)
+    ax.fill_between(agp.minute, agp.p10, agp.p90, alpha=0.2)
+    ax.plot(agp.minute, agp.median, linewidth=2)
 
     ax.axhline(70, linestyle="--")
     ax.axhline(180, linestyle="--")
 
-    ax.set_xlabel("Hora do dia")
+    ax.set_xlim(0, 1440)
+    ax.set_xlabel("Minutos do dia")
     ax.set_ylabel("Glicemia (mg/dL)")
-    ax.set_title("AGP simplificado – Dia médio")
+    ax.set_title("AGP – Perfil Ambulatorial de Glicose")
 
     return fig
 
 
 # =========================================================
-# INTERFACE
+# SESSION STATE
 # =========================================================
-st.title("🩺 Insulin Pump Clinical Trainer")
+if "basal_profile" not in st.session_state:
+    st.session_state.basal_profile = {h: 1.0 for h in range(24)}
 
-# SESSION STATE — À PROVA DE CRASH
-if "state" not in st.session_state:
-    st.session_state.state = PhysiologyState()
+if "ic" not in st.session_state:
+    st.session_state.ic = 10
 
-if "history" not in st.session_state:
-    st.session_state.history = []
+# =========================================================
+# SIDEBAR – AJUSTES CLÍNICOS
+# =========================================================
+st.sidebar.header("Ajustes para próxima consulta")
 
-if "step" not in st.session_state:
-    st.session_state.step = 0
+night_basal = st.sidebar.slider("Basal noturno (0–6h)", 0.3, 2.5, 1.0, 0.1)
+day_basal = st.sidebar.slider("Basal diurno (6–22h)", 0.3, 2.5, 1.0, 0.1)
 
-# SIDEBAR
-pump_type = st.sidebar.selectbox(
-    "Tipo de bomba",
-    ["Convencional", "Suspensão automática", "Híbrido (AID)"]
-)
+for h in range(24):
+    st.session_state.basal_profile[h] = night_basal if h < 6 else day_basal
 
-days = st.sidebar.slider("Dias por consulta", 7, 30, 14)
-basal = st.sidebar.slider("Basal (U/h)", 0.5, 2.0, 1.0, 0.1)
-ic = st.sidebar.slider("IC (g/U)", 5, 20, 10)
+st.session_state.ic = st.sidebar.slider("IC (g/U)", 5, 20, st.session_state.ic)
 
-delay = st.sidebar.slider("Atraso de bolus (min)", 0, 30, 15)
-variability = st.sidebar.slider("Variabilidade", 0.0, 5.0, 1.0)
+variability = st.sidebar.slider("Variabilidade CGM", 2.0, 10.0, 6.0)
 
-patient = PatientProfile(delay, variability)
-pump = PumpSettings(basal, ic)
+# =========================================================
+# EXECUÇÃO
+# =========================================================
+if st.button("▶️ Rodar consulta"):
+    patient = PatientProfile(variability)
+    pump = PumpSettings(st.session_state.basal_profile, st.session_state.ic)
 
-# STEP 0
-if st.session_state.step == 0:
-    if st.button("▶️ Rodar consulta"):
-        state, df = simulate_consultation(
-            st.session_state.state, patient, pump, pump_type, days
-        )
-        st.session_state.state = state
-        st.session_state.history.append(df)
-        st.session_state.step = 1
-
-# STEP 1
-if st.session_state.step == 1:
-    df = st.session_state.history[-1]
-    metrics = clinical_metrics(df)
+    df = simulate(14, patient, pump)
 
     st.pyplot(plot_agp(df))
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Glicemia média", metrics["mean"])
-    c2.metric("TIR (%)", metrics["tir"])
-    c3.metric("TBR (%)", metrics["tbr"])
-    c4.metric("CV (%)", metrics["cv"])
